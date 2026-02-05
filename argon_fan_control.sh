@@ -5,7 +5,7 @@
 # DESCRIPTION: Argon ONE V3 Fan Control Daemon (OpenWrt / RPi 5)
 # AUTHOR: ciwga
 # DATE: 2026-02-03
-# VERSION: 1.0.0
+# VERSION: 1.1.0 (Ash/POSIX Compliant)
 #
 # LICENSE: MIT / GPLv3
 # PLATFORM: OpenWrt (Ash Shell), Raspberry Pi 5
@@ -20,7 +20,9 @@
 # SAFETY & ENVIRONMENT
 # ------------------------------------------------------------------------------
 # -u: Treat unset variables as an error when substituting.
+# -e: Exit immediately if a command exits with a non-zero status.
 set -u
+set -e
 
 # Ensure standard locale for string processing (awk, grep stability)
 export LC_ALL=C
@@ -60,13 +62,28 @@ readonly THRESH_QUIET=40
 SENSOR_ERR_STATE=0
 I2C_ERR_STATE=0
 CURRENT_LEVEL=0
-LAST_WRITE_TIME=$SECONDS
+LAST_WRITE_TIME=0
 DETECTED_BUS=""
 THERMAL_ZONE_PATH=""
 
 # ------------------------------------------------------------------------------
 # FUNCTIONS
 # ------------------------------------------------------------------------------
+
+# Function: get_uptime
+# Description: Returns the system uptime in seconds (integer).
+#              Replaces $SECONDS which is not available in Ash.
+# Returns: Integer seconds.
+get_uptime() {
+    local up
+    if [ -r /proc/uptime ]; then
+        read -r up _ < /proc/uptime
+        echo "${up%%.*}" # Strip decimals
+    else
+        # Fallback if /proc is unreadable (unlikely)
+        date +%s
+    fi
+}
 
 # Function: log_info
 # Description: Logs informational messages to the system log (syslog).
@@ -102,6 +119,302 @@ check_dependencies() {
     if ! command -v i2cdetect >/dev/null 2>&1; then
         log_err "Missing Dependency: 'i2cdetect' not found. (Run: opkg install i2c-tools)"
         missing=1
+    fi
+    if ! command -v i2cset >/dev/null 2>&1; then
+        log_err "Missing Dependency: 'i2cset' not found. (Run: opkg install i2c-tools)"
+        missing=1
+    fi
+
+    if [ "$missing" -eq 1 ]; then
+        exit 1
+    fi
+}
+
+# Function: acquire_lock
+# Description: Implements an atomic locking mechanism using mkdir.
+#              Prevents multiple instances of the daemon.
+# Returns: 0 on success, exits on failure.
+acquire_lock() {
+    # 'mkdir' is atomic on POSIX filesystems.
+    if mkdir "$LOCK_DIR" >/dev/null 2>&1; then
+        echo $$ > "$PID_FILE"
+        return 0
+    else
+        # Lock exists, check for stale PID
+        if [ -f "$PID_FILE" ]; then
+            # 'read -r' is safe for raw input
+            read -r OLD_PID < "$PID_FILE" 2>/dev/null || OLD_PID=""
+            
+            # Check if process is actually running via /proc
+            if [ -n "$OLD_PID" ] && [ -d "/proc/$OLD_PID" ]; then
+                log_err "Service is already running (PID: $OLD_PID). Exiting."
+                exit 1
+            else
+                log_info "Stale lock detected. Cleaning up..."
+                rm -f "$PID_FILE"
+                rmdir "$LOCK_DIR" 2>/dev/null || true
+                
+                # Retry lock acquisition
+                if mkdir "$LOCK_DIR" >/dev/null 2>&1; then
+                    echo $$ > "$PID_FILE"
+                    return 0
+                fi
+            fi
+        fi
+        log_err "Could not acquire lock. Check permissions for /var/run."
+        exit 1
+    fi
+}
+
+# Function: find_thermal_source
+# Description: Scans sysfs to identify the correct thermal zone for the CPU/SoC.
+# Returns: 0 if found (prints path), 1 if not found.
+find_thermal_source() {
+    local zone
+    local type_val
+    local found_path=""
+
+    # Scan thermal zones
+    for zone in /sys/class/thermal/thermal_zone*; do
+        [ -e "$zone/type" ] || continue
+        
+        read -r type_val < "$zone/type" 2>/dev/null || continue
+        
+        # Match common RPi and Linux thermal types
+        case "$type_val" in
+            "cpu-thermal"|"soc-thermal"|"x86_pkg_temp"|"bcm2835_thermal")
+                found_path="$zone/temp"
+                log_info "Thermal Sensor Detected: $type_val -> $found_path"
+                break
+                ;;
+        esac
+    done
+
+    # Fallback for RPi 5 if no specific label matches
+    if [ -z "$found_path" ]; then
+        if [ -f "/sys/class/thermal/thermal_zone0/temp" ]; then
+            log_info "WARNING: Specific thermal label not found, defaulting to 'thermal_zone0'."
+            found_path="/sys/class/thermal/thermal_zone0/temp"
+        else
+            return 1
+        fi
+    fi
+    
+    echo "$found_path"
+    return 0
+}
+
+# Function: find_i2c_bus
+# Description: Scans I2C buses to find the Argon ONE chip (Address 0x1a).
+# Returns: 0 if found (prints bus number), 1 if not found.
+find_i2c_bus() {
+    local dev
+    local bus_num
+    local found
+    
+    for dev in /dev/i2c-*; do
+        [ -e "$dev" ] || continue
+        # Extract bus number from filename (e.g., /dev/i2c-1 -> 1)
+        bus_num="${dev##*-}"
+        
+        # Check for device 0x1a or UU (kernel driver occupied) on the bus
+        # Uses explicit '-y' and '-r' flags for non-interactive mode
+        found=$(i2cdetect -y -r "$bus_num" 2>/dev/null | awk '
+            BEGIN { found=0 }
+            {
+                for(i=2; i<=NF; i++) {
+                    if($i == "1a" || $i == "UU") { found=1; exit }
+                }
+            }
+            END { print found }
+        ')
+        
+        if [ "$found" -eq 1 ]; then
+            echo "$bus_num"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Function: i2c_write
+# Description: Writes a value to the I2C register with error handling.
+# Arguments:
+#   $1: Bus number
+#   $2: Register address
+#   $3: Value (Hex)
+# Returns: 0 on success, 1 on failure.
+i2c_write() {
+    local bus="$1"
+    local reg="$2"
+    local val="$3"
+    
+    # Suppress output, capture exit code
+    if ! i2cset -y -f "$bus" "$CHIP_ADDR" "$reg" "$val" >/dev/null 2>&1; then
+        # Log error only once to prevent log flooding
+        if [ "$I2C_ERR_STATE" -eq 0 ]; then
+            log_err "I2C Communication Error! Bus: $bus, Reg: $reg, Val: $val"
+            I2C_ERR_STATE=1
+        fi
+        return 1
+    else
+        # Recovery detection
+        if [ "$I2C_ERR_STATE" -eq 1 ]; then
+            log_info "I2C connection restored."
+            I2C_ERR_STATE=0
+        fi
+        return 0
+    fi
+}
+
+# Function: cleanup
+# Description: Signal handler for graceful shutdown. Sets fan to safe speed.
+cleanup() {
+    # Disable exit-on-error for cleanup to ensure it runs to completion
+    set +e
+    log_info "Shutdown signal received (SIGTERM/SIGINT)..."
+    
+    # Check if bus was detected before trying to write
+    if [ -n "${DETECTED_BUS:-}" ]; then
+        # Set fan to Medium speed (safe fail-safe) on exit
+        i2c_write "$DETECTED_BUS" "0x01" "$SPEED_MED"
+    fi
+    
+    rm -f "$PID_FILE"
+    rmdir "$LOCK_DIR" 2>/dev/null
+    log_info "Service stopped successfully."
+    exit 0
+}
+
+# ------------------------------------------------------------------------------
+# MAIN EXECUTION FLOW
+# ------------------------------------------------------------------------------
+
+# Register signal handlers for procd compatibility
+trap cleanup EXIT TERM INT HUP
+
+check_root
+check_dependencies
+acquire_lock
+
+log_info "Starting Argon ONE v3 Daemon (Platform: OpenWrt/RPi5)..."
+
+# 1. Initialize Sensors
+THERMAL_ZONE_PATH=$(find_thermal_source) || true
+if [ -z "$THERMAL_ZONE_PATH" ]; then
+    log_err "CRITICAL: No valid temperature sensor found! Check kernel modules."
+    rm -f "$PID_FILE"
+    rmdir "$LOCK_DIR" 2>/dev/null
+    exit 1
+fi
+
+# 2. Initialize I2C
+DETECTED_BUS=$(find_i2c_bus) || true
+if [ -z "$DETECTED_BUS" ]; then
+    log_err "CRITICAL: Argon One (0x1a) not found on I2C bus! (Check config.txt: dtparam=i2c_arm=on)"
+    rm -f "$PID_FILE"
+    rmdir "$LOCK_DIR" 2>/dev/null
+    exit 1
+fi
+
+log_info "Configuration Successful: Bus=/dev/i2c-$DETECTED_BUS | Sensor=$THERMAL_ZONE_PATH"
+
+# 3. Kickstart Fan
+# Mode setting (0x03) varies by firmware revision, kept for safety.
+i2c_write "$DETECTED_BUS" "0x03" "0x01"
+# Spin up to full speed briefly to overcome static friction
+i2c_write "$DETECTED_BUS" "0x01" "$SPEED_HIGH"
+sleep 1
+i2c_write "$DETECTED_BUS" "0x01" "$SPEED_OFF"
+
+log_info "Entering Main Control Loop. Interval: ${POLL_INTERVAL}s"
+
+# Initialize Timer
+LAST_WRITE_TIME=$(get_uptime)
+
+# 4. Main Loop
+while true; do
+    # A. Read Temperature
+    if read -r RAW_TEMP < "$THERMAL_ZONE_PATH" 2>/dev/null; then
+        : # No-op, successful read
+    else
+        RAW_TEMP="-1"
+    fi
+
+    # B. Validate Reading
+    if [ -z "$RAW_TEMP" ] || [ "$RAW_TEMP" -lt 0 ]; then
+         TEMP=65 # Safe fallback temp
+         if [ "$SENSOR_ERR_STATE" -eq 0 ]; then 
+            log_err "Sensor Read Error! Activating Safe Mode (Assuming Temp=65)."
+            SENSOR_ERR_STATE=1
+         fi
+    else
+         # Integer division (ash shell standard)
+         TEMP=$((RAW_TEMP / 1000))
+         
+         if [ "$SENSOR_ERR_STATE" -eq 1 ]; then
+            log_info "Sensor reading restored. Current: ${TEMP}C"
+            SENSOR_ERR_STATE=0
+         fi
+    fi
+
+    # C. Determine Target Fan Level
+    if   [ "$TEMP" -ge "$THRESH_HIGH" ];  then TARGET=4
+    elif [ "$TEMP" -ge "$THRESH_MED" ];   then TARGET=3
+    elif [ "$TEMP" -ge "$THRESH_LOW" ];   then TARGET=2
+    elif [ "$TEMP" -ge "$THRESH_QUIET" ]; then TARGET=1
+    else TARGET=0; fi
+
+    # D. Apply Hysteresis (Prevent Rapid Cycling)
+    if [ "$TARGET" -gt "$CURRENT_LEVEL" ]; then
+        # If temp is rising, increase speed immediately (Active Cooling Priority)
+        NEW_LEVEL=$TARGET
+    elif [ "$TARGET" -lt "$CURRENT_LEVEL" ]; then
+        # If temp is falling, apply hysteresis window
+        case "$CURRENT_LEVEL" in
+            4) BASE=$THRESH_HIGH ;;
+            3) BASE=$THRESH_MED ;;
+            2) BASE=$THRESH_LOW ;;
+            1) BASE=$THRESH_QUIET ;;
+            *) BASE=0 ;;
+        esac
+        
+        # Only drop speed if temp is significantly below threshold (BASE - HYST)
+        if [ "$TEMP" -le $((BASE - HYST)) ]; then
+             NEW_LEVEL=$TARGET
+        else
+             NEW_LEVEL=$CURRENT_LEVEL
+        fi
+    else
+        NEW_LEVEL=$CURRENT_LEVEL
+    fi
+
+    # E. Actuate Fan & Heartbeat
+    CURRENT_TIME=$(get_uptime)
+    TIME_DIFF=$((CURRENT_TIME - LAST_WRITE_TIME))
+    
+    # Write if level changed OR heartbeat interval elapsed
+    if [ "$NEW_LEVEL" -ne "$CURRENT_LEVEL" ] || [ "$TIME_DIFF" -ge "$HEARTBEAT_INTERVAL" ]; then
+        case "$NEW_LEVEL" in
+            4) HEX="$SPEED_HIGH" ;;
+            3) HEX="$SPEED_MED" ;;
+            2) HEX="$SPEED_LOW" ;;
+            1) HEX="$SPEED_QUIET" ;;
+            *) HEX="$SPEED_OFF" ;;
+        esac
+
+        if i2c_write "$DETECTED_BUS" "0x01" "$HEX"; then
+            if [ "$NEW_LEVEL" -ne "$CURRENT_LEVEL" ]; then
+                log_info "State Changed: ${TEMP}C -> Fan Level: $NEW_LEVEL ($HEX)"
+            fi
+            CURRENT_LEVEL=$NEW_LEVEL
+            LAST_WRITE_TIME=$CURRENT_TIME
+        fi
+    fi
+
+    # F. Wait for next cycle
+    sleep "$POLL_INTERVAL"
+done        missing=1
     fi
     if ! command -v i2cset >/dev/null 2>&1; then
         log_err "Missing Dependency: 'i2cset' not found. (Run: opkg install i2c-tools)"
