@@ -44,7 +44,7 @@ fi
 log_info "Updating package lists and installing dependencies..."
 opkg update >/dev/null 2>&1
 
-if opkg install i2c-tools coreutils-logger; then
+if opkg install i2c-tools; then
     log_info "Dependencies installed successfully."
 else
     log_err "Failed to install packages. Check your internet connection."
