@@ -61,7 +61,7 @@ If you prefer to install manually without the script:
 1.  **Install Dependencies:**
     ```bash
     opkg update
-    opkg install i2c-tools coreutils-logger
+    opkg install i2c-tools
     ```
 
 2.  **Enable I2C:**
