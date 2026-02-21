@@ -5,7 +5,7 @@
 # DESCRIPTION: Argon ONE V3 Fan Control Daemon (OpenWrt / RPi 5 Fix)
 # AUTHOR: ciwga (Refactored for Ash/OpenWrt compatibility)
 # DATE: 2026-02-06
-# VERSION: 1.2.0
+# VERSION: 1.2.1
 #
 # LICENSE: MIT / GPLv3
 # PLATFORM: OpenWrt (Ash Shell), Raspberry Pi 5
@@ -27,6 +27,7 @@ export LC_ALL=C
 # CONFIGURATION CONSTANTS
 # ------------------------------------------------------------------------------
 readonly CHIP_ADDR="0x1a"
+readonly REG_FAN="0x80" # Argon ONE V3 specific Fan Register
 readonly LOCK_DIR="/var/run/argon_fan.lock"
 readonly PID_FILE="${LOCK_DIR}/pid"
 
@@ -258,7 +259,7 @@ cleanup() {
     # Check if bus was detected before trying to write
     if [ -n "${DETECTED_BUS:-}" ]; then
         # Set fan to Medium speed (safe fail-safe) on exit
-        i2c_write "$DETECTED_BUS" "0x01" "$SPEED_MED"
+        i2c_write "$DETECTED_BUS" "$REG_FAN" "$SPEED_MED"
     fi
     
     rm -f "$PID_FILE"
@@ -309,12 +310,10 @@ fi
 log_info "Configuration Successful: Bus=/dev/i2c-$DETECTED_BUS | Sensor=$THERMAL_ZONE_PATH"
 
 # 3. Kickstart Fan
-# Initialize fan mode (0x03 -> 0x01)
-i2c_write "$DETECTED_BUS" "0x03" "0x01"
-# Spin up to full speed briefly to overcome static friction
-i2c_write "$DETECTED_BUS" "0x01" "$SPEED_HIGH"
+# Spin up to full speed briefly to overcome static friction using V3 Register
+i2c_write "$DETECTED_BUS" "$REG_FAN" "$SPEED_HIGH"
 sleep 1
-i2c_write "$DETECTED_BUS" "0x01" "$SPEED_OFF"
+i2c_write "$DETECTED_BUS" "$REG_FAN" "$SPEED_OFF"
 
 log_info "Entering Main Control Loop. Interval: ${POLL_INTERVAL}s"
 
@@ -392,7 +391,7 @@ while true; do
             *) HEX="$SPEED_OFF" ;;
         esac
 
-        if i2c_write "$DETECTED_BUS" "0x01" "$HEX"; then
+        if i2c_write "$DETECTED_BUS" "$REG_FAN" "$HEX"; then
             if [ "$NEW_LEVEL" -ne "$CURRENT_LEVEL" ]; then
                 log_info "State Changed: ${TEMP}C -> Fan Level: $NEW_LEVEL ($HEX)"
             fi
@@ -404,6 +403,3 @@ while true; do
     # F. Wait for next cycle
     sleep "$POLL_INTERVAL"
 done
-
-
-
