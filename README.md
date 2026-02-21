@@ -1,5 +1,11 @@
 # Argon ONE V3 Fan Control for OpenWrt
 
+> ⚠️ **UPGRADE NOTICE** ⚠️
+> 
+> **While this project remains fully functional and usable, a more advanced version is now available.**
+> I highly recommend migrating to [**luci-app-argononev3-fancontrol**](https://github.com/ciwga/luci-app-argononev3-fancontrol). 
+> The new project features a complete LuCI web interface for OpenWrt, allowing you to easily configure thresholds and monitor temperatures directly from your browser without using the command line.
+
 A lightweight, production-grade fan control daemon specifically designed for the **Argon ONE V3 Case** running **OpenWrt** on **Raspberry Pi 5**.
 
 This project provides a silence-focused, hysteresis-aware cooling solution that communicates directly with the Argon ONE MCU via I2C, ensuring your device stays cool without unnecessary noise.
@@ -43,7 +49,7 @@ The easiest way to install is using the automated installer script. It will hand
 2.  **Run the following command:**
 
 ```bash
-wget -O - https://raw.githubusercontent.com/ciwga/argon-one-v3-fan-openwrt/main/install.sh | sh
+wget -O - [https://raw.githubusercontent.com/ciwga/argon-one-v3-fan-openwrt/main/install.sh](https://raw.githubusercontent.com/ciwga/argon-one-v3-fan-openwrt/main/install.sh) | sh
 ```
 
 3.  **Reboot your device** (Required to enable the I2C bus):
@@ -101,6 +107,7 @@ i2cdetect -y 1
 ```
 * **Success:** You see `1a` or `UU` at row `10`, column `a`.
 * **Failure:** The table is empty. Check `/boot/config.txt` and reboot.
+
 
 ## 📄 License
 MIT / GPLv3 License. See [LICENSE](LICENSE) for details.
